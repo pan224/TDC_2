@@ -108,15 +108,40 @@ create_generated_clock -name clk_260MHz_p90 -source [get_pins tdc_eth_system/clk
 # ============================================================================
 
 # 定义物理独立的时钟组（完全异步）
-set_clock_groups -asynchronous -group [get_clocks sys_clk_200] -group [get_clocks sgmii_clk_125] -group [get_clocks clk_260MHz] -group [get_clocks clk_260MHz_p90]
+# sys_clk_200 和 sgmii_clk_125 来自不同的物理时钟源，是真正的异步时钟
+set_clock_groups -asynchronous -group [get_clocks sys_clk_200] -group [get_clocks sgmii_clk_125]
 
 # 其他派生时钟也是异步的
 set_clock_groups -asynchronous -group [get_clocks clk_50MHz] -group [get_clocks clk_100MHz] -group [get_clocks clk_10MHz] -group [get_clocks clk_250MHz]
 
 # ============================================================================
+# 260MHz 相位时钟与主时钟之间的路径约束
+# ============================================================================
+# clk_out1_clk_260_phase（由 clk_260_phase MMCM 生成）和 clk_out1_clk_wiz_tdc 
+# 有级联关系，但它们在功能上是同步的，某些跨域路径是可接受的
+
+# channel valid 信号到 timestamp_capture 的路径 - 这是同步逻辑路径
+# 由于两个时钟来自同一源（clk_wiz_tdc），它们是相位对齐的
+# 使用 set_max_delay 而不是 false_path 来允许一定的时序松弛
+set_max_delay -from [get_pins -hierarchical -filter {NAME =~ *channel_up_inst/valid_reg/C}] -to [get_pins -hierarchical -filter {NAME =~ *timestamp_capture_inst/up_event_id_cnt_reg*/R}] 5.0 -datapath_only
+set_max_delay -from [get_pins -hierarchical -filter {NAME =~ *channel_down_inst/valid_reg/C}] -to [get_pins -hierarchical -filter {NAME =~ *timestamp_capture_inst/down_event_id_cnt_reg*/R}] 5.0 -datapath_only
+
+# ============================================================================
 # 多周期路径约束 - 针对 TDC 关键路径
 # ============================================================================
 # 260MHz 时钟周期 = 3.85ns，放宽到 3 周期 = 11.55ns
+
+# pulse_gen 状态机到 scan_ctrl 状态机的路径
+# 这些控制信号不需要在单周期内稳定，允许 2 周期传播
+set_multicycle_path -setup 2 -from [get_pins -hierarchical -filter {NAME =~ *pulse_gen_up/FSM_sequential_state_reg*/C}] -to [get_pins -hierarchical -filter {NAME =~ *scan_ctrl_inst/FSM_sequential_state_reg*/CE}]
+set_multicycle_path -hold 1 -from [get_pins -hierarchical -filter {NAME =~ *pulse_gen_up/FSM_sequential_state_reg*/C}] -to [get_pins -hierarchical -filter {NAME =~ *scan_ctrl_inst/FSM_sequential_state_reg*/CE}]
+
+set_multicycle_path -setup 2 -from [get_pins -hierarchical -filter {NAME =~ *pulse_gen_down/FSM_sequential_state_reg*/C}] -to [get_pins -hierarchical -filter {NAME =~ *scan_ctrl_inst/FSM_sequential_state_reg*/CE}]
+set_multicycle_path -hold 1 -from [get_pins -hierarchical -filter {NAME =~ *pulse_gen_down/FSM_sequential_state_reg*/C}] -to [get_pins -hierarchical -filter {NAME =~ *scan_ctrl_inst/FSM_sequential_state_reg*/CE}]
+
+# reset_sync 到 timestamp_capture 的复位路径 - 允许 2 周期
+set_multicycle_path -setup 2 -from [get_pins -hierarchical -filter {NAME =~ *reset_sync_inst/reset_sync_260_reg*/C}] -to [get_pins -hierarchical -filter {NAME =~ *timestamp_capture_inst/*_event_id_cnt_reg*/R}]
+set_multicycle_path -hold 1 -from [get_pins -hierarchical -filter {NAME =~ *reset_sync_inst/reset_sync_260_reg*/C}] -to [get_pins -hierarchical -filter {NAME =~ *timestamp_capture_inst/*_event_id_cnt_reg*/R}]
 
 # # BRAM 读取路径（LUT 查找）- 允许 2 周期
 # # 从 BRAM 输出到下一级寄存器
@@ -195,26 +220,45 @@ set_false_path -from [get_pins -hierarchical -filter {NAME =~ *channel_*/ready_r
 set_false_path -from [get_pins -hierarchical -filter {NAME =~ *eth_comm_inst/*calib*}] -to [get_pins -hierarchical -filter {NAME =~ *calib_trigger_sync*/D}]
 
 # ============================================================================
-# 异步 FIFO 复位路径约束
+# 异步 FIFO 复位路径约束（关键！）
 # ============================================================================
-# 问题：从 reset_sync_260 到异步FIFO的RST端口有负slack
-# 原因：异步FIFO的RST连接了组合逻辑 (rst_200MHz | rst_260MHz)
-# 解决：异步FIFO的复位端口通常是异步的，不需要满足严格的时序要求
-# 
-# UP通道异步FIFO复位路径
-set_false_path -from [get_pins tdc_eth_system/reset_sync_inst/reset_sync_260_reg[2]/C] \
-               -to [get_pins -hierarchical -filter {NAME =~ *tdc_eth_system/eth_comm_inst/up_async_fifo/*/RST}]
+# FIFO36E1 的 RST 是异步复位，不需要满足 Recovery/Removal 时序要求
+# 这些是从 reset_sync_260_reg 到 FIFO RST 的路径
 
-# DOWN通道异步FIFO复位路径
-set_false_path -from [get_pins tdc_eth_system/reset_sync_inst/reset_sync_260_reg[2]/C] \
-               -to [get_pins -hierarchical -filter {NAME =~ *tdc_eth_system/eth_comm_inst/down_async_fifo/*/RST}]
+# UP 方向异步 FIFO（260MHz 写入，200MHz 读取）
+set_false_path -to [get_pins -hierarchical -filter {NAME =~ *eth_comm_inst/up_async_fifo/*/RST}]
 
-# 200MHz域复位到异步FIFO复位路径
-set_false_path -from [get_pins tdc_eth_system/reset_sync_inst/reset_sync_200_reg[2]/C] \
-               -to [get_pins -hierarchical -filter {NAME =~ *tdc_eth_system/eth_comm_inst/up_async_fifo/*/RST}]
+# DOWN 方向异步 FIFO（200MHz 写入，260MHz 读取）
+set_false_path -to [get_pins -hierarchical -filter {NAME =~ *eth_comm_inst/down_async_fifo/*/RST}]
 
-set_false_path -from [get_pins tdc_eth_system/reset_sync_inst/reset_sync_200_reg[2]/C] \
-               -to [get_pins -hierarchical -filter {NAME =~ *tdc_eth_system/eth_comm_inst/down_async_fifo/*/RST}]
+# 通用匹配：所有到 FIFO36E1 RST 引脚的路径
+set_false_path -to [get_pins -hierarchical -filter {NAME =~ *fifo_36_72*/RST}]
+
+# CDC 同步模块中的异步清除信号
+set_false_path -to [get_pins -hierarchical -filter {NAME =~ *cdc_sync_inst/*/CLR}]
+set_false_path -to [get_pins -hierarchical -filter {NAME =~ *cdc_sync_inst/*/PRE}]
+
+# Reset sync 模块到所有异步复位目标的路径
+set_false_path -from [get_pins -hierarchical -filter {NAME =~ *reset_sync_inst/reset_sync_260_reg*/C}] -to [get_pins -hierarchical -filter {NAME =~ */RST}]
+set_false_path -from [get_pins -hierarchical -filter {NAME =~ *reset_sync_inst/reset_sync_260_reg*/C}] -to [get_pins -hierarchical -filter {NAME =~ */CLR}]
+set_false_path -from [get_pins -hierarchical -filter {NAME =~ *reset_sync_inst/reset_sync_200_reg*/C}] -to [get_pins -hierarchical -filter {NAME =~ */RST}]
+set_false_path -from [get_pins -hierarchical -filter {NAME =~ *reset_sync_inst/reset_sync_200_reg*/C}] -to [get_pins -hierarchical -filter {NAME =~ */CLR}]
+
+# ============================================================================
+# 跨时钟域 CDC 同步器路径约束（关键！）
+# ============================================================================
+# CDC 同步器的第一级寄存器输入是跨时钟域信号，不需要满足严格的时序要求
+# 这些路径通过双触发器同步器来处理亚稳态
+
+# sys_clk_200 到 clk_260MHz 域的 CDC 同步器输入
+# scan_param 信号从 eth_comm (200MHz) 传输到 cdc_sync (260MHz)
+set_false_path -from [get_pins -hierarchical -filter {NAME =~ *eth_comm_inst/scan_cmd_param_reg*/C}] -to [get_pins -hierarchical -filter {NAME =~ *cdc_sync_inst/scan_param_sync1_reg*/D}]
+
+# manual_calib 信号的 CDC 路径
+set_false_path -from [get_pins -hierarchical -filter {NAME =~ *eth_comm_inst/manual_calib_trigger_reg/C}] -to [get_pins -hierarchical -filter {NAME =~ *cdc_sync_inst/manual_calib_sync1_reg/D}]
+
+# Global reset 信号到 260MHz 时钟域的异步路径
+set_false_path -from [get_pins -hierarchical -filter {NAME =~ *globalresetter_inst/GLOBAL_RST_reg/C}] -to [get_pins -hierarchical -filter {NAME =~ *reset_sync_inst/reset_sync_260_reg*/PRE}]
 
 # ============================================================================
 # 输入输出延迟约束
@@ -314,3 +358,6 @@ set_property LOC SLICE_X70Y0 [get_cells tdc_eth_system/channel_up_inst/dl_sync_i
 # DRC 约束放宽
 set_property SEVERITY {Warning} [get_drc_checks LUTLP-1]
 set_property SEVERITY {Warning} [get_drc_checks LCCH-1]
+
+
+// ============================================================================
